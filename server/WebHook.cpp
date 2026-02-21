@@ -877,10 +877,7 @@ void do_stream_proxy_hook(bool is_start, const std::string &key,
                           const mediakit::MediaTuple &tuple,
                           const std::string &url,
                           const std::string &err_msg) {
-    GET_CONFIG(bool, hook_enable, Hook::kEnable);
-    if (!hook_enable) {
-        return;
-    }
+    // proxy hook 不依赖全局 hook.enable 开关，只要配置了 url 就触发
     GET_CONFIG(string, hook_url, is_start ? Hook::kOnStreamProxyStarted : Hook::kOnStreamProxyStopped);
     if (hook_url.empty()) {
         return;

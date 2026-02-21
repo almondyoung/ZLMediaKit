@@ -50,6 +50,15 @@ void PlayerProxy::setOnClose(function<void(const SockException &ex)> cb) {
     _on_close = cb ? std::move(cb) : [](const SockException &) {};
 }
 
+// 内部辅助：触发一次 on_close 后清空，防止重复触发
+static void fireAndClear(std::function<void(const toolkit::SockException &)> &cb, const toolkit::SockException &ex) {
+    std::function<void(const toolkit::SockException &)> tmp;
+    std::swap(tmp, cb);
+    if (tmp) {
+        tmp(ex);
+    }
+}
+
 void PlayerProxy::setOnDisconnect(std::function<void()> cb) {
     _on_disconnect = cb ? std::move(cb) : [] () {};
 }
@@ -140,7 +149,7 @@ void PlayerProxy::play(const string &strUrlTmp) {
         } else {
             // 达到了最大重试次数，回调关闭  [AUTO-TRANSLATED:610f31f3]
             // Reached the maximum number of retries, callback to close
-            strongSelf->_on_close(err);
+            fireAndClear(strongSelf->_on_close, err);
         }
     });
     setOnShutdown([weakSelf, strUrlTmp, piFailedCnt](const SockException &err) {
@@ -186,7 +195,7 @@ void PlayerProxy::play(const string &strUrlTmp) {
         } else {
             // 达到了最大重试次数，回调关闭  [AUTO-TRANSLATED:610f31f3]
             // Reached the maximum number of retries, callback to close
-            strongSelf->_on_close(err);
+            fireAndClear(strongSelf->_on_close, err);
         }
     });
     try {
@@ -234,6 +243,8 @@ PlayerProxy::~PlayerProxy() {
         }
         _on_play = nullptr;
     }
+    // 析构时（如 delStreamProxy 直接 erase）也触发 on_close 回调
+    fireAndClear(_on_close, SockException(Err_shutdown, "player proxy destroyed"));
 }
 
 void PlayerProxy::rePlay(const string &strUrl, int iFailedCnt) {
@@ -262,7 +273,7 @@ bool PlayerProxy::close(MediaSource &sender) {
     _muxer = nullptr;
     setMediaSource(nullptr);
     teardown();
-    _on_close(SockException(Err_shutdown, "closed by user"));
+    fireAndClear(_on_close, SockException(Err_shutdown, "closed by user"));
     WarnL << "close media: " << sender.getUrl();
     return true;
 }

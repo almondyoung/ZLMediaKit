@@ -878,7 +878,9 @@ void do_stream_proxy_hook(bool is_start, const std::string &key,
                           const std::string &url,
                           const std::string &err_msg) {
     // proxy hook 不依赖全局 hook.enable 开关，只要配置了 url 就触发
-    GET_CONFIG(string, hook_url, is_start ? Hook::kOnStreamProxyStarted : Hook::kOnStreamProxyStopped);
+    // GET_CONFIG 宏内部使用 static 变量，key 必须是编译期常量，不能用三元表达式
+    const auto &config_key = is_start ? Hook::kOnStreamProxyStarted : Hook::kOnStreamProxyStopped;
+    auto hook_url = ::toolkit::mINI::Instance()[config_key];
     if (hook_url.empty()) {
         return;
     }

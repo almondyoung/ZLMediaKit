@@ -14,6 +14,7 @@
 #include <string>
 #include <functional>
 #include "json/json.h"
+#include "Common/MediaSource.h"
 
 // 支持json或urlencoded方式传输参数  [AUTO-TRANSLATED:0e14d484]
 // // Support json or urlencoded way to transmit parameters
@@ -48,4 +49,17 @@ void onProcessExited();
  * [AUTO-TRANSLATED:8ffdd09b]
  */
 void do_http_hook(const std::string &url, const ArgsType &body, const std::function<void(const Json::Value &, const std::string &)> &func = nullptr);
+
+/**
+ * 触发拉流代理状态 hook
+ * @param is_start true=拉流成功, false=拉流结束
+ * @param key      proxy key (shortUrl)
+ * @param tuple    媒体元组
+ * @param url      源流地址
+ * @param err_msg  结束原因（is_start=true 时为空）
+ */
+void do_stream_proxy_hook(bool is_start, const std::string &key,
+                          const mediakit::MediaTuple &tuple,
+                          const std::string &url,
+                          const std::string &err_msg);
 #endif //ZLMEDIAKIT_WEBHOOK_H

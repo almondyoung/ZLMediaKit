@@ -613,17 +613,22 @@ void addStreamProxy(const MediaTuple &tuple, const string &url, int retry_count,
 
     // 开始播放，如果播放失败或者播放中止，将会自动重试若干次，默认一直重试  [AUTO-TRANSLATED:ac8499e5]
     // Start playing. If playback fails or is stopped, it will automatically retry several times, by default it will retry indefinitely
-    player->setPlayCallbackOnce([cb, key](const SockException &ex) {
+    player->setPlayCallbackOnce([cb, key, tuple, url](const SockException &ex) {
         if (ex) {
             s_player_proxy.erase(key);
+        } else {
+            // 拉流成功，触发 hook
+            do_stream_proxy_hook(true, key, tuple, url, "");
         }
         cb(ex, key);
     });
 
     // 被主动关闭拉流  [AUTO-TRANSLATED:41a19476]
     // The pull stream was actively closed
-    player->setOnClose([key](const SockException &ex) {
+    player->setOnClose([key, tuple, url](const SockException &ex) {
         s_player_proxy.erase(key);
+        // 拉流结束，触发 hook
+        do_stream_proxy_hook(false, key, tuple, url, ex.what());
     });
     player->play(url);
 };

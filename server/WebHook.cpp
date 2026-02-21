@@ -54,6 +54,8 @@ const string kOnServerExited = HOOK_FIELD "on_server_exited";
 const string kOnServerKeepalive = HOOK_FIELD "on_server_keepalive";
 const string kOnSendRtpStopped = HOOK_FIELD "on_send_rtp_stopped";
 const string kOnRtpServerTimeout = HOOK_FIELD "on_rtp_server_timeout";
+const string kOnStreamProxyStarted = HOOK_FIELD "on_stream_proxy_started";
+const string kOnStreamProxyStopped = HOOK_FIELD "on_stream_proxy_stopped";
 const string kAliveInterval = HOOK_FIELD "alive_interval";
 const string kRetry = HOOK_FIELD "retry";
 const string kRetryDelay = HOOK_FIELD "retry_delay";
@@ -80,6 +82,8 @@ static onceToken token([]() {
     mINI::Instance()[kOnServerKeepalive] = "";
     mINI::Instance()[kOnSendRtpStopped] = "";
     mINI::Instance()[kOnRtpServerTimeout] = "";
+    mINI::Instance()[kOnStreamProxyStarted] = "";
+    mINI::Instance()[kOnStreamProxyStopped] = "";
     mINI::Instance()[kAliveInterval] = 30.0;
     mINI::Instance()[kRetry] = 1;
     mINI::Instance()[kRetryDelay] = 3.0;
@@ -867,6 +871,30 @@ void installWebHook() {
     // 定时上报保活  [AUTO-TRANSLATED:bd2364a0]
     // Report keep-alive regularly
     reportServerKeepalive();
+}
+
+void do_stream_proxy_hook(bool is_start, const std::string &key,
+                          const mediakit::MediaTuple &tuple,
+                          const std::string &url,
+                          const std::string &err_msg) {
+    GET_CONFIG(bool, hook_enable, Hook::kEnable);
+    if (!hook_enable) {
+        return;
+    }
+    GET_CONFIG(string, hook_url, is_start ? Hook::kOnStreamProxyStarted : Hook::kOnStreamProxyStopped);
+    if (hook_url.empty()) {
+        return;
+    }
+    ArgsType body;
+    body["key"]    = key;
+    body[VHOST_KEY] = tuple.vhost;
+    body["app"]    = tuple.app;
+    body["stream"] = tuple.stream;
+    body["url"]    = url;
+    if (!err_msg.empty()) {
+        body["err"] = err_msg;
+    }
+    do_http_hook(hook_url, body, nullptr);
 }
 
 void unInstallWebHook() {

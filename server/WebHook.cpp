@@ -17,6 +17,7 @@
 #include "Http/HttpSession.h"
 #include "Http/HttpRequester.h"
 #include "Network/Session.h"
+#include "Network/sockutil.h"
 #include "Rtsp/RtspSession.h"
 #include "Player/PlayerProxy.h"
 #include "WebHook.h"
@@ -892,6 +893,21 @@ void do_stream_proxy_hook(bool is_start, const std::string &key,
     body["url"]    = url;
     if (!err_msg.empty()) {
         body["err"] = err_msg;
+    }
+    if (is_start) {
+        // 构造 FLV 播放地址，使用本机非 loopback IP
+        auto local_ip = toolkit::SockUtil::get_local_ip();
+        auto http_port = (int)::toolkit::mINI::Instance()["http.port"];
+        if (http_port <= 0) {
+            http_port = 80;
+        }
+        // http://ip[:port]/app/stream.live.flv
+        std::string flv_url = "http://" + local_ip;
+        if (http_port != 80) {
+            flv_url += ":" + std::to_string(http_port);
+        }
+        flv_url += "/" + tuple.app + "/" + tuple.stream + ".live.flv";
+        body["flv_url"] = flv_url;
     }
     do_http_hook(hook_url, body, nullptr);
 }

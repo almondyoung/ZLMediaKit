@@ -11,10 +11,20 @@
 #include <stdio.h>
 #include <sys/stat.h>
 #include <algorithm>
+#include <cctype>
+#include <cstring>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 #include "Common/config.h"
+#include "Common/MultiMediaSourceMuxer.h"
 #include "Common/strCoding.h"
 #include "HttpSession.h"
+#include "HttpChunkedSplitter.h"
 #include "HttpConst.h"
+#include "Rtmp/FlvSplitter.h"
+#include "Rtmp/RtmpMediaSourceImp.h"
+#include "Rtp/Decoder.h"
 #include "Util/base64.h"
 #include "Util/SHA1.h"
 
@@ -22,6 +32,645 @@ using namespace std;
 using namespace toolkit;
 
 namespace mediakit {
+
+static constexpr size_t kHttpPublishAuthCacheMaxSize = 16 * 1024 * 1024;
+static constexpr size_t kHttpPublishAuthCacheMaxMS = 10 * 1000;
+
+static bool isPostLikeMethod(const string &method) {
+    return !strcasecmp(method.data(), "POST") || !strcasecmp(method.data(), "PUT");
+}
+
+static bool isChunkedTransfer(const Parser &parser) {
+    auto transfer = parser["Transfer-Encoding"];
+    std::transform(transfer.begin(), transfer.end(), transfer.begin(), [](unsigned char ch) { return (char)std::tolower(ch); });
+    return transfer.find("chunked") != string::npos;
+}
+
+static bool hasHttpPublishConflictSource(const string &vhost, const string &app, const string &stream) {
+    static const char *s_schemas[] = {
+        RTMP_SCHEMA,
+        RTSP_SCHEMA,
+        RTC_SCHEMA,
+        TS_SCHEMA,
+        FMP4_SCHEMA,
+        HLS_SCHEMA,
+        HLS_FMP4_SCHEMA
+    };
+    for (auto schema : s_schemas) {
+        if (MediaSource::find(schema, vhost, app, stream)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+class HttpPublisherBase : public MediaSourceEvent, public enable_shared_from_this<HttpPublisherBase> {
+public:
+    using Ptr = shared_ptr<HttpPublisherBase>;
+
+    HttpPublisherBase(MediaInfo info, weak_ptr<HttpSession> session, MediaOriginType origin_type, string format_name) {
+        _media_info = std::move(info);
+        _session = std::move(session);
+        _origin_type = origin_type;
+        _format_name = std::move(format_name);
+    }
+
+    ~HttpPublisherBase() override { releasePublishClaim(); }
+
+    void start() {
+        if (_auth_started) {
+            return;
+        }
+        _auth_started = true;
+        _cache_ticker.resetTime();
+
+        auto session = _session.lock();
+        if (!session) {
+            _state = State::kClosed;
+            return;
+        }
+
+        weak_ptr<HttpPublisherBase> weak_self = shared_from_this();
+        Broadcast::PublishAuthInvoker invoker = [weak_self](const string &err, const ProtocolOption &option) {
+            auto strong_self = weak_self.lock();
+            if (!strong_self) {
+                return;
+            }
+            auto session = strong_self->_session.lock();
+            if (!session) {
+                return;
+            }
+            session->async([weak_self, err, option]() {
+                auto strong_self = weak_self.lock();
+                if (strong_self) {
+                    strong_self->onPublishAuth(err, option);
+                }
+            });
+        };
+
+        auto flag = NOTICE_EMIT(BroadcastMediaPublishArgs, Broadcast::kBroadcastMediaPublish,
+                                _origin_type, _media_info, invoker, *session);
+        if (!flag) {
+            onPublishAuth("", ProtocolOption());
+        }
+    }
+
+    void input(const char *data, size_t len) {
+        if (!len || _state == State::kClosed || _state == State::kRejected) {
+            return;
+        }
+        _total_bytes += len;
+
+        if (_state == State::kAuthenticating) {
+            cacheInput(data, len);
+            return;
+        }
+
+        inputReady(data, len);
+    }
+
+    void onEof() {
+        _eof = true;
+        if (_state == State::kReady) {
+            onPublisherEof();
+            closeSession(toolkit::SockException(toolkit::Err_shutdown, StrPrinter << _format_name << " publish completed"), 100);
+        }
+    }
+
+    void onSessionError(const toolkit::SockException &err) {
+        if (_state == State::kClosed) {
+            return;
+        }
+        _state = State::kClosed;
+        releasePublishClaim();
+        onSessionError_l(err);
+    }
+
+    const MediaInfo &getMediaInfo() const { return _media_info; }
+    const string &getFormatName() const { return _format_name; }
+    uint64_t getTotalBytes() const { return _total_bytes; }
+    uint64_t getAliveSecond() const { return _ticker.createdTime() / 1000; }
+
+protected:
+    enum class State {
+        kAuthenticating,
+        kReady,
+        kRejected,
+        kClosed
+    };
+
+    const MediaInfo &mediaInfo() const { return _media_info; }
+    uint32_t continuePushMS() const { return _continue_push_ms; }
+    shared_ptr<HttpSession> session() const { return _session.lock(); }
+
+    virtual bool setupPublisher(const ProtocolOption &option, int &code, string &msg) = 0;
+    virtual void inputReady(const char *data, size_t len) = 0;
+    virtual void onPublisherEof() {}
+    virtual void onSessionError_l(const toolkit::SockException &err) { (void)err; }
+    virtual int totalReaderCount_l(MediaSource &sender) = 0;
+    virtual shared_ptr<MultiMediaSourceMuxer> getMuxer_l(MediaSource &sender) const {
+        (void)sender;
+        return nullptr;
+    }
+    virtual vector<string> getPublishClaimKeys(const ProtocolOption &option) const {
+        vector<string> ret;
+        auto &info = mediaInfo();
+        ret.emplace_back(makePublishClaimKey(info.vhost, info.app, info.stream));
+        if (!option.stream_replace.empty() && option.stream_replace != info.stream) {
+            ret.emplace_back(makePublishClaimKey(info.vhost, info.app, option.stream_replace));
+        }
+        return ret;
+    }
+
+    static string makePublishClaimKey(const string &vhost, const string &app, const string &stream) {
+        return vhost + "\n" + app + "\n" + stream;
+    }
+
+    void reject(int code, const string &msg) {
+        releasePublishClaim();
+        _state = State::kRejected;
+        if (!_response_sent) {
+            sendPublishResponseOnce(code, true, msg);
+            return;
+        }
+        closeSession(toolkit::SockException(toolkit::Err_shutdown, msg));
+    }
+
+    void closeSession(const toolkit::SockException &ex, uint64_t delay_ms = 0) {
+        if (auto session = _session.lock()) {
+            if (!delay_ms) {
+                session->shutdown(ex);
+                return;
+            }
+            weak_ptr<HttpSession> weak_session = session;
+            auto err_code = ex.getErrCode();
+            string err_msg = ex.what();
+            session->getPoller()->doDelayTask(delay_ms, [weak_session, err_code, err_msg]() {
+                if (auto strong_session = weak_session.lock()) {
+                    strong_session->shutdown(toolkit::SockException(err_code, err_msg));
+                }
+                return 0;
+            });
+        }
+    }
+
+private:
+    void onPublishAuth(const string &err, const ProtocolOption &option) {
+        if (_state != State::kAuthenticating) {
+            return;
+        }
+        if (!err.empty()) {
+            reject(401, err);
+            return;
+        }
+
+        if (!claimPublish(option)) {
+            reject(409, "Already publishing.");
+            return;
+        }
+
+        int code = 500;
+        string msg = "publish setup failed";
+        if (!setupPublisher(option, code, msg)) {
+            releasePublishClaim();
+            reject(code, msg);
+            return;
+        }
+
+        _continue_push_ms = option.continue_push_ms;
+        _state = State::kReady;
+
+        if (auto session = _session.lock()) {
+            session->setSocketFlags();
+        }
+        sendPublishResponseOnce(200, false, "OK");
+        flushCachedInput();
+        if (_eof && _state == State::kReady) {
+            onPublisherEof();
+            closeSession(toolkit::SockException(toolkit::Err_shutdown, StrPrinter << _format_name << " publish completed"), 100);
+        }
+    }
+
+    void cacheInput(const char *data, size_t len) {
+        if (_cached_input.size() + len > kHttpPublishAuthCacheMaxSize ||
+            _cache_ticker.elapsedTime() > kHttpPublishAuthCacheMaxMS) {
+            reject(503, "on_publish response timeout or cached http publish body is too large");
+            return;
+        }
+        _cached_input.append(data, len);
+    }
+
+    void flushCachedInput() {
+        if (_cached_input.empty() || _state != State::kReady) {
+            return;
+        }
+        auto cached = std::move(_cached_input);
+        _cached_input.clear();
+        auto cached_size = cached.size();
+        cached.push_back('\0');
+        inputReady(&cached[0], cached_size);
+    }
+
+    void sendPublishResponseOnce(int code, bool close, const string &body) {
+        if (_response_sent) {
+            return;
+        }
+        _response_sent = true;
+        auto session = _session.lock();
+        if (!session) {
+            return;
+        }
+        HttpSession::KeyValue header;
+        header.emplace("Cache-Control", "no-store");
+        session->sendResponse(code, close, "text/plain", header, std::make_shared<HttpStringBody>(body));
+    }
+
+    bool claimPublish(const ProtocolOption &option) {
+        auto keys = getPublishClaimKeys(option);
+        keys.erase(std::remove_if(keys.begin(), keys.end(), [](const string &key) { return key.empty(); }), keys.end());
+        std::sort(keys.begin(), keys.end());
+        keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+        if (keys.empty()) {
+            return false;
+        }
+
+        lock_guard<mutex> lck(publishMutex());
+        for (auto &key : keys) {
+            auto it = publishMap().find(key);
+            if (it != publishMap().end()) {
+                auto owner = it->second.lock();
+                if (owner && owner.get() != this) {
+                    return false;
+                }
+            }
+        }
+        auto self = shared_from_this();
+        for (auto &key : keys) {
+            publishMap()[key] = self;
+        }
+        _claim_keys = std::move(keys);
+        _claim_acquired = true;
+        return true;
+    }
+
+    void releasePublishClaim() {
+        if (!_claim_acquired) {
+            return;
+        }
+        lock_guard<mutex> lck(publishMutex());
+        for (auto &key : _claim_keys) {
+            auto it = publishMap().find(key);
+            if (it != publishMap().end()) {
+                auto owner = it->second.lock();
+                if (!owner || owner.get() == this) {
+                    publishMap().erase(it);
+                }
+            }
+        }
+        _claim_acquired = false;
+        _claim_keys.clear();
+    }
+
+    bool close(MediaSource &sender) override {
+        closeSession(toolkit::SockException(toolkit::Err_shutdown, "close media: " + sender.getUrl()));
+        return true;
+    }
+
+    int totalReaderCount(MediaSource &sender) override {
+        return totalReaderCount_l(sender);
+    }
+
+    MediaOriginType getOriginType(MediaSource &sender) const override {
+        (void)sender;
+        return _origin_type;
+    }
+
+    string getOriginUrl(MediaSource &sender) const override {
+        (void)sender;
+        return _media_info.full_url;
+    }
+
+    shared_ptr<toolkit::SockInfo> getOriginSock(MediaSource &sender) const override {
+        (void)sender;
+        return _session.lock();
+    }
+
+    toolkit::EventPoller::Ptr getOwnerPoller(MediaSource &sender) override {
+        (void)sender;
+        auto session = _session.lock();
+        if (!session) {
+            throw std::runtime_error("HttpPublisherBase::getOwnerPoller failed: session released");
+        }
+        return session->getPoller();
+    }
+
+    shared_ptr<MultiMediaSourceMuxer> getMuxer(MediaSource &sender) const override {
+        return getMuxer_l(sender);
+    }
+
+    static mutex &publishMutex() {
+        static mutex s_mutex;
+        return s_mutex;
+    }
+
+    static unordered_map<string, weak_ptr<HttpPublisherBase> > &publishMap() {
+        static unordered_map<string, weak_ptr<HttpPublisherBase> > s_map;
+        return s_map;
+    }
+
+private:
+    bool _auth_started = false;
+    bool _response_sent = false;
+    bool _eof = false;
+    bool _claim_acquired = false;
+    State _state = State::kAuthenticating;
+    uint32_t _continue_push_ms = 0;
+    uint64_t _total_bytes = 0;
+    string _cached_input;
+    vector<string> _claim_keys;
+    string _format_name;
+    toolkit::Ticker _ticker;
+    toolkit::Ticker _cache_ticker;
+    MediaInfo _media_info;
+    weak_ptr<HttpSession> _session;
+    MediaOriginType _origin_type = MediaOriginType::unknown;
+};
+
+class HttpFlvPublisher : public HttpPublisherBase, private FlvSplitter {
+public:
+    using Ptr = shared_ptr<HttpFlvPublisher>;
+
+    HttpFlvPublisher(MediaInfo info, weak_ptr<HttpSession> session)
+        : HttpPublisherBase(std::move(info), std::move(session), MediaOriginType::http_flv_push, "HTTP-FLV") {}
+
+private:
+    bool setupPublisher(const ProtocolOption &option, int &code, string &msg) override {
+        assert(!_push_src);
+        auto &info = mediaInfo();
+        if (!option.stream_replace.empty() && option.stream_replace != info.stream &&
+            hasHttpPublishConflictSource(info.vhost, info.app, option.stream_replace)) {
+            code = 409;
+            msg = "Already publishing.";
+            return false;
+        }
+
+        auto src = MediaSource::find(RTMP_SCHEMA, info.vhost, info.app, info.stream);
+        auto push_failed = (bool)src;
+
+        while (src) {
+            auto rtmp_src = dynamic_pointer_cast<RtmpMediaSourceImp>(src);
+            if (!rtmp_src) {
+                break;
+            }
+            auto ownership = rtmp_src->getOwnership();
+            if (!ownership) {
+                break;
+            }
+            _push_src = std::move(rtmp_src);
+            _push_src_ownership = std::move(ownership);
+            push_failed = false;
+            break;
+        }
+
+        if (push_failed) {
+            code = 409;
+            msg = "Already publishing.";
+            return false;
+        }
+
+        if (!_push_src) {
+            _push_src = std::make_shared<RtmpMediaSourceImp>(info);
+            _push_src_ownership = _push_src->getOwnership();
+            if (!_push_src_ownership) {
+                code = 409;
+                msg = "Already publishing.";
+                return false;
+            }
+            _push_src->setProtocolOption(option);
+        }
+
+        _push_src->setListener(shared_from_this());
+        return true;
+    }
+
+    void inputReady(const char *data, size_t len) override {
+        try {
+            FlvSplitter::input(data, len);
+        } catch (std::exception &ex) {
+            reject(400, StrPrinter << "bad http-flv publish body: " << ex.what());
+        }
+    }
+
+    void onSessionError_l(const toolkit::SockException &err) override {
+        if (_push_src && continuePushMS() && err.getErrCode() != toolkit::Err_shutdown) {
+            _push_src_ownership = nullptr;
+            auto push_src = std::move(_push_src);
+            auto strong_session = session();
+            if (strong_session) {
+                strong_session->getPoller()->doDelayTask(continuePushMS(), [push_src]() { return 0; });
+            }
+            return;
+        }
+        _push_src_ownership = nullptr;
+        _push_src = nullptr;
+    }
+
+    void onRecvFlvHeader(const FLVHeader &header) override {
+        (void)header;
+    }
+
+    bool onRecvMetadata(const AMFValue &metadata) override {
+        if (!_push_src) {
+            return false;
+        }
+        _push_src->setMetaData(metadata);
+        _set_metadata = true;
+        return true;
+    }
+
+    bool shouldDropRtmpPacket(const RtmpPacket::Ptr &packet) const {
+        if (!packet || !packet->size()) {
+            WarnL << "drop empty http-flv rtmp packet";
+            return true;
+        }
+
+        switch (packet->type_id) {
+            case MSG_AUDIO: {
+                auto codec = (RtmpAudioCodec)packet->getRtmpCodecId();
+                if ((codec == RtmpAudioCodec::aac || codec == RtmpAudioCodec::ex_header || codec == RtmpAudioCodec::opus) &&
+                    packet->size() < 2) {
+                    WarnL << "drop too short http-flv audio packet, codec:" << (int)codec << ", size:" << packet->size();
+                    return true;
+                }
+                return false;
+            }
+            case MSG_VIDEO: {
+                if (packet->size() < 2) {
+                    WarnL << "drop too short http-flv video packet, size:" << packet->size();
+                    return true;
+                }
+
+                if (((uint8_t)packet->buffer[0]) >> 7) {
+                    auto pkt_type = (RtmpPacketType)(((uint8_t)packet->buffer[0]) & 0x0F);
+                    if (pkt_type == RtmpPacketType::PacketTypeSequenceEnd) {
+                        return true;
+                    }
+                    return false;
+                }
+
+                auto codec = (RtmpVideoCodec)packet->getRtmpCodecId();
+                if (codec == RtmpVideoCodec::h264 || codec == RtmpVideoCodec::h265) {
+                    auto pkt_type = (RtmpH264PacketType)(uint8_t)packet->buffer[1];
+                    if (pkt_type == RtmpH264PacketType::h264_end_seq) {
+                        return true;
+                    }
+                    if (pkt_type == RtmpH264PacketType::h264_config_header && packet->size() <= 5) {
+                        WarnL << "drop too short http-flv video config packet, codec:" << (int)codec << ", size:" << packet->size();
+                        return true;
+                    }
+                    if (pkt_type == RtmpH264PacketType::h264_nalu && packet->size() <= 9) {
+                        WarnL << "drop too short http-flv video nalu packet, codec:" << (int)codec << ", size:" << packet->size();
+                        return true;
+                    }
+                }
+                return false;
+            }
+            default:
+                return false;
+        }
+    }
+
+    void onRecvRtmpPacket(RtmpPacket::Ptr packet) override {
+        if (!_push_src) {
+            return;
+        }
+        if (shouldDropRtmpPacket(packet)) {
+            return;
+        }
+        if (!_set_metadata) {
+            _push_src->setMetaData(TitleMeta().getMetadata());
+            _set_metadata = true;
+        }
+        _push_src->onWrite(std::move(packet));
+    }
+
+    int totalReaderCount_l(MediaSource &sender) override {
+        return _push_src ? _push_src->totalReaderCount() : sender.readerCount();
+    }
+
+private:
+    bool _set_metadata = false;
+    RtmpMediaSourceImp::Ptr _push_src;
+    shared_ptr<void> _push_src_ownership;
+};
+
+class HttpMpegPublisher : public HttpPublisherBase {
+public:
+    HttpMpegPublisher(MediaInfo info,
+                      weak_ptr<HttpSession> session,
+                      MediaOriginType origin_type,
+                      string format_name,
+                      DecoderImp::Type decoder_type)
+        : HttpPublisherBase(std::move(info), std::move(session), origin_type, std::move(format_name))
+        , _decoder_type(decoder_type) {}
+
+private:
+    bool setupPublisher(const ProtocolOption &option, int &code, string &msg) override {
+        if (!hasOutputProtocol(option)) {
+            code = 503;
+            msg = StrPrinter << getFormatName() << " publish has no output protocol enabled";
+            return false;
+        }
+
+        if (hasConflictSource(option)) {
+            code = 409;
+            msg = "Already publishing.";
+            return false;
+        }
+
+        try {
+            _muxer = std::make_shared<MultiMediaSourceMuxer>(mediaInfo(), 0.0f, option);
+            _muxer->setMediaListener(shared_from_this());
+            _decoder = DecoderImp::createDecoder(_decoder_type, _muxer.get());
+        } catch (std::exception &ex) {
+            _decoder = nullptr;
+            _muxer = nullptr;
+            code = 503;
+            msg = StrPrinter << getFormatName() << " publish output setup failed: " << ex.what();
+            return false;
+        }
+
+        if (!_decoder) {
+            _muxer = nullptr;
+            code = 503;
+            msg = StrPrinter << getFormatName() << " publish is unavailable, related demuxer is disabled by build options";
+            return false;
+        }
+        return true;
+    }
+
+    void inputReady(const char *data, size_t len) override {
+        if (!_decoder) {
+            reject(503, StrPrinter << getFormatName() << " demuxer is not ready");
+            return;
+        }
+
+        try {
+            auto ret = _decoder->input(reinterpret_cast<const uint8_t *>(data), len);
+            if (ret < 0) {
+                reject(400, StrPrinter << "bad " << getFormatName() << " publish body");
+            }
+        } catch (std::exception &ex) {
+            reject(400, StrPrinter << "bad " << getFormatName() << " publish body: " << ex.what());
+        }
+    }
+
+    void onPublisherEof() override {
+        if (_decoder) {
+            _decoder->flush();
+        }
+    }
+
+    void onSessionError_l(const toolkit::SockException &err) override {
+        (void)err;
+        _decoder = nullptr;
+        _muxer = nullptr;
+    }
+
+    int totalReaderCount_l(MediaSource &sender) override {
+        return _muxer ? _muxer->totalReaderCount() : sender.readerCount();
+    }
+
+    shared_ptr<MultiMediaSourceMuxer> getMuxer_l(MediaSource &sender) const override {
+        (void)sender;
+        return _muxer;
+    }
+
+    bool hasOutputProtocol(const ProtocolOption &option) const {
+        return option.enable_rtmp || option.enable_rtsp || option.enable_hls || option.enable_hls_fmp4 || option.enable_mp4 ||
+               option.enable_ts || option.enable_fmp4;
+    }
+
+    bool hasConflictSource(const ProtocolOption &option) const {
+        auto &info = mediaInfo();
+        if (hasConflictSource(info.vhost, info.app, info.stream)) {
+            return true;
+        }
+        if (!option.stream_replace.empty() && option.stream_replace != info.stream) {
+            return hasConflictSource(info.vhost, info.app, option.stream_replace);
+        }
+        return false;
+    }
+
+    bool hasConflictSource(const string &vhost, const string &app, const string &stream) const {
+        return hasHttpPublishConflictSource(vhost, app, stream);
+    }
+
+private:
+    DecoderImp::Type _decoder_type;
+    DecoderImp::Ptr _decoder;
+    MultiMediaSourceMuxer::Ptr _muxer;
+};
 
 HttpSession::HttpSession(const Socket::Ptr &pSock) : Session(pSock) {
     // 设置默认参数  [AUTO-TRANSLATED:ae5b72e6]
@@ -82,13 +731,18 @@ ssize_t HttpSession::onRecvHeader(const char *header, size_t len) {
         return 0;
     }
 
+    bool is_post_like = isPostLikeMethod(cmd);
+    if (is_post_like && !strcasecmp(_parser["Expect"].data(), "100-continue")) {
+        SockSender::send(std::string("HTTP/1.1 100 Continue\r\n\r\n"));
+    }
+
     size_t content_len;
     auto &content_len_str = _parser["Content-Length"];
     if (content_len_str.empty()) {
-        if (it->first == "POST") {
+        if (is_post_like) {
             // Http post未指定长度，我们认为是不定长的body  [AUTO-TRANSLATED:3578206b]
             // Http post does not specify length, we consider it to be an indefinite length body
-            WarnL << "Received http post request without content-length, consider it to be unlimited length";
+            WarnL << "Received http request without content-length, consider it to be unlimited length";
             content_len = SIZE_MAX;
         } else {
             content_len = 0;
@@ -160,6 +814,7 @@ ssize_t HttpSession::onRecvHeader(const char *header, size_t len) {
 void HttpSession::onRecvContent(const char *data, size_t len) {
     if (_on_recv_body && !_on_recv_body(data, len)) {
         _on_recv_body = nullptr;
+        _chunked_splitter = nullptr;
     }
 }
 
@@ -169,6 +824,20 @@ void HttpSession::onRecv(const Buffer::Ptr &pBuf) {
 }
 
 void HttpSession::onError(const SockException &err) {
+    if (_http_publisher) {
+        auto &info = _http_publisher->getMediaInfo();
+        auto duration = _http_publisher->getAliveSecond();
+        auto total_bytes = _http_publisher->getTotalBytes();
+        WarnP(this) << _http_publisher->getFormatName() << "推流器(" << info.shortUrl() << ")断开:" << err.what() << ",耗时(s):" << duration;
+
+        GET_CONFIG(uint32_t, iFlowThreshold, General::kFlowThreshold);
+        if (total_bytes >= iFlowThreshold * 1024) {
+            NOTICE_EMIT(BroadcastFlowReportArgs, Broadcast::kBroadcastFlowReport, info, total_bytes, duration, false, *this);
+        }
+        _http_publisher->onSessionError(err);
+        return;
+    }
+
     if (_is_live_stream) {
         // flv/ts播放器  [AUTO-TRANSLATED:5b444fd9]
         // flv/ts player
@@ -799,6 +1468,181 @@ void HttpSession::urlDecode(Parser &parser) {
     }
 }
 
+bool HttpSession::parseHttpPublishInfo(const Parser &parser,
+                                       MediaInfo &info,
+                                       string &err,
+                                       string &format,
+                                       MediaOriginType &origin_type) {
+    if (!isPostLikeMethod(parser.method())) {
+        return false;
+    }
+
+    auto url = parser.url();
+    string schema;
+    if (end_with(url, ".live.flv")) {
+        url.resize(url.size() - strlen(".live.flv"));
+        schema = RTMP_SCHEMA;
+        format = "flv";
+        origin_type = MediaOriginType::http_flv_push;
+    } else if (end_with(url, ".flv")) {
+        url.resize(url.size() - strlen(".flv"));
+        schema = RTMP_SCHEMA;
+        format = "flv";
+        origin_type = MediaOriginType::http_flv_push;
+    } else if (end_with(url, ".live.ts")) {
+        url.resize(url.size() - strlen(".live.ts"));
+        schema = TS_SCHEMA;
+        format = "ts";
+        origin_type = MediaOriginType::http_ts_push;
+    } else if (end_with(url, ".ts")) {
+        url.resize(url.size() - strlen(".ts"));
+        schema = TS_SCHEMA;
+        format = "ts";
+        origin_type = MediaOriginType::http_ts_push;
+    } else if (end_with(url, ".live.ps")) {
+        url.resize(url.size() - strlen(".live.ps"));
+        schema = "ps";
+        format = "ps";
+        origin_type = MediaOriginType::http_ps_push;
+    } else if (end_with(url, ".ps")) {
+        url.resize(url.size() - strlen(".ps"));
+        schema = "ps";
+        format = "ps";
+        origin_type = MediaOriginType::http_ps_push;
+    } else {
+        return false;
+    }
+
+    if (!parser.params().empty()) {
+        url += "?";
+        url += parser.params();
+    }
+
+    auto host = parser["Host"];
+    if (host.empty()) {
+        host = DEFAULT_VHOST;
+    }
+    info.parse(schema + "://" + host + url);
+    info.protocol = overSsl() ? "https" : "http";
+
+    if (info.app.empty() || info.stream.empty()) {
+        err = StrPrinter << "http-" << format << " publish url is invalid";
+    }
+    return true;
+}
+
+shared_ptr<HttpPublisherBase> HttpSession::getHttpPublisher(const Parser &parser, bool &is_push_request) {
+    is_push_request = false;
+    if (_http_publisher) {
+        is_push_request = true;
+        return _http_publisher;
+    }
+    if (_http_publish_error) {
+        is_push_request = true;
+        return nullptr;
+    }
+
+    MediaInfo info;
+    string err;
+    string format;
+    MediaOriginType origin_type = MediaOriginType::unknown;
+    if (!parseHttpPublishInfo(parser, info, err, format, origin_type)) {
+        return nullptr;
+    }
+    is_push_request = true;
+
+    if (!err.empty()) {
+        _http_publish_error = true;
+        sendResponse(400, true, "text/plain", KeyValue(), std::make_shared<HttpStringBody>(err));
+        return nullptr;
+    }
+
+    _media_info = info;
+    auto session = static_pointer_cast<HttpSession>(shared_from_this());
+    if (format == "flv") {
+        _http_publisher = std::make_shared<HttpFlvPublisher>(info, session);
+    } else if (format == "ts") {
+        _http_publisher = std::make_shared<HttpMpegPublisher>(info, session, origin_type, "HTTP-TS", DecoderImp::decoder_ts);
+    } else if (format == "ps") {
+        _http_publisher = std::make_shared<HttpMpegPublisher>(info, session, origin_type, "HTTP-PS", DecoderImp::decoder_ps);
+    }
+    if (!_http_publisher) {
+        _http_publish_error = true;
+        sendResponse(415, true, "text/plain", KeyValue(), std::make_shared<HttpStringBody>("unsupported http publish format"));
+        return nullptr;
+    }
+
+    _http_publisher->start();
+    return _http_publisher;
+}
+
+void HttpSession::onRecvUnlimitedContent(const Parser &header,
+                                         const char *data,
+                                         size_t len,
+                                         size_t totalSize,
+                                         size_t recvedSize) {
+    if (isChunkedTransfer(header)) {
+        if (!_chunked_splitter) {
+            auto header_copy = header;
+            weak_ptr<HttpSession> weak_self = static_pointer_cast<HttpSession>(shared_from_this());
+            _chunked_splitter = std::make_shared<HttpChunkedSplitter>([weak_self, header_copy](const char *chunk_data, size_t chunk_len) {
+                auto strong_self = weak_self.lock();
+                if (!strong_self) {
+                    return;
+                }
+                strong_self->onRecvChunkedContent(header_copy, chunk_data, chunk_len);
+            });
+        }
+        try {
+            _chunked_splitter->input(data, len);
+        } catch (std::exception &ex) {
+            sendResponse(400, true, "text/plain", KeyValue(), std::make_shared<HttpStringBody>(ex.what()));
+        }
+        return;
+    }
+
+    onRecvUnlimitedContent_l(header, data, len, totalSize, recvedSize);
+}
+
+void HttpSession::onRecvUnlimitedContent_l(const Parser &header,
+                                           const char *data,
+                                           size_t len,
+                                           size_t totalSize,
+                                           size_t recvedSize) {
+    bool is_push_request = false;
+    auto publisher = getHttpPublisher(header, is_push_request);
+    if (!is_push_request) {
+        shutdown(SockException(Err_shutdown, "http post content is too huge,default closed"));
+        return;
+    }
+    if (!publisher) {
+        return;
+    }
+
+    publisher->input(data, len);
+    if (totalSize != SIZE_MAX && recvedSize >= totalSize) {
+        publisher->onEof();
+    }
+}
+
+void HttpSession::onRecvChunkedContent(const Parser &header, const char *data, size_t len) {
+    bool is_push_request = false;
+    auto publisher = getHttpPublisher(header, is_push_request);
+    if (!is_push_request) {
+        shutdown(SockException(Err_shutdown, "http chunked post content is too huge,default closed"));
+        return;
+    }
+    if (!publisher) {
+        return;
+    }
+
+    if (!len) {
+        publisher->onEof();
+        return;
+    }
+    publisher->input(data, len);
+}
+
 bool HttpSession::emitHttpEvent(bool doInvoke) {
     bool bClose = !strcasecmp(_parser["Connection"].data(), "close");
     // ///////////////////异步回复Invoker///////////////////////////////  [AUTO-TRANSLATED:6d0c5fda]
@@ -840,6 +1684,38 @@ std::string HttpSession::get_peer_ip() {
 }
 
 void HttpSession::onHttpRequest_POST() {
+    if (_parser.content().empty()) {
+        MediaInfo info;
+        string err;
+        string format;
+        MediaOriginType origin_type = MediaOriginType::unknown;
+        if (parseHttpPublishInfo(_parser, info, err, format, origin_type)) {
+            _http_publish_error = true;
+            if (err.empty()) {
+                err = StrPrinter << "http-" << format << " publish body is empty";
+            }
+            sendResponse(400, true, "text/plain", KeyValue(), std::make_shared<HttpStringBody>(err));
+            return;
+        }
+    }
+
+    bool is_push_request = false;
+    auto publisher = getHttpPublisher(_parser, is_push_request);
+    if (is_push_request) {
+        if (publisher && !_parser.content().empty()) {
+            auto content = _parser.content();
+            auto content_size = content.size();
+            content.push_back('\0');
+            publisher->input(&content[0], content_size);
+            publisher->onEof();
+        } else if (!publisher) {
+            // getHttpPublisher has already sent the error response.
+        } else {
+            auto err = "http publish body is empty";
+            sendResponse(400, true, "text/plain", KeyValue(), std::make_shared<HttpStringBody>(err));
+        }
+        return;
+    }
     emitHttpEvent(true);
 }
 

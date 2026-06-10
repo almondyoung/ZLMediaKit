@@ -33,12 +33,12 @@ typedef struct {
                                          const mk_media_source sender);
 
     /**
-     * 收到rtsp/rtmp推流事件广播，通过该事件控制推流鉴权
+     * 收到rtsp/rtmp/http-flv/http-ts/http-ps推流事件广播，通过该事件控制推流鉴权
      * @see mk_publish_auth_invoker_do
      * @param url_info 推流url相关信息
      * @param invoker 执行invoker返回鉴权结果
      * @param sender 该tcp客户端相关信息
-     * Receive rtsp/rtmp push stream event broadcast, control push stream authentication through this event
+     * Receive rtsp/rtmp/http-flv/http-ts/http-ps push stream event broadcast, control push stream authentication through this event
      * @see mk_publish_auth_invoker_do
      * @param url_info Push stream url related information
      * @param invoker Execute invoker to return authentication result
@@ -51,12 +51,12 @@ typedef struct {
                                          const mk_sock_info sender);
 
     /**
-     * 播放rtsp/rtmp/http-flv/hls事件广播，通过该事件控制播放鉴权
+     * 播放rtsp/rtmp/http-flv/http-ts/http-fmp4/hls事件广播，通过该事件控制播放鉴权
      * @see mk_auth_invoker_do
      * @param url_info 播放url相关信息
      * @param invoker 执行invoker返回鉴权结果
      * @param sender 播放客户端相关信息
-     * Play rtsp/rtmp/http-flv/hls event broadcast, control playback authentication through this event
+     * Play rtsp/rtmp/http-flv/http-ts/http-fmp4/hls event broadcast, control playback authentication through this event
      * @see mk_auth_invoker_do
      * @param url_info Play url related information
      * @param invoker Execute invoker to return authentication result
@@ -225,12 +225,12 @@ typedef struct {
                                        const mk_sock_info sender);
 
     /**
-     * 停止rtsp/rtmp/http-flv会话后流量汇报事件广播
+     * 停止rtsp/rtmp/http-flv/http-ts/http-ps会话后流量汇报事件广播
      * @param url_info 播放url相关信息
      * @param total_bytes 耗费上下行总流量，单位字节数
      * @param total_seconds 本次tcp会话时长，单位秒
      * @param is_player 客户端是否为播放器
-     * Stop rtsp/rtmp/http-flv session after traffic reporting event broadcast
+     * Stop rtsp/rtmp/http-flv/http-ts/http-ps session after traffic reporting event broadcast
      * @param url_info Play url related information
      * @param total_bytes Total traffic consumed up and down, unit bytes
      * @param total_seconds The duration of this tcp session, unit seconds

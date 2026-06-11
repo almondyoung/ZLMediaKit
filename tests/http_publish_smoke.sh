@@ -69,6 +69,19 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
 }
 
+need_ffmpeg_encoder() {
+  ffmpeg -hide_banner -loglevel error -h "encoder=$1" >/dev/null 2>&1 || \
+    die "missing required ffmpeg encoder: $1"
+}
+
+stream_logs() {
+  local stream="$1"
+  local file
+  for file in "${TMP_DIR}/${stream}.push."*.log; do
+    [[ -f "${file}" ]] && printf '%s\n' "${file}"
+  done
+}
+
 alloc_port() {
   python3 - <<'PY'
 import socket
@@ -88,6 +101,9 @@ PLAYBACK_RW_TIMEOUT_US="${PLAYBACK_RW_TIMEOUT_US:-1000000}"
 PLAYBACK_READY_TIMEOUT_SEC="${PLAYBACK_READY_TIMEOUT_SEC:-14}"
 if [[ "${EXPECT_TS_DISABLED}" != "1" && "${EXPECT_PS_DISABLED}" != "1" ]]; then
   need_cmd ffmpeg
+  need_ffmpeg_encoder libx264
+  need_ffmpeg_encoder aac
+  need_ffmpeg_encoder mp2
 fi
 
 [[ -x "${MEDIA_SERVER_BIN}" ]] || die "MediaServer is not executable: ${MEDIA_SERVER_BIN}"
@@ -395,6 +411,7 @@ decode_flv_playback() {
   local deadline=$((SECONDS + PLAYBACK_READY_TIMEOUT_SEC))
   local attempt=0
   local log_file=""
+  local logs=()
 
   while (( SECONDS < deadline )); do
     attempt=$((attempt + 1))
@@ -408,7 +425,11 @@ decode_flv_playback() {
     sleep 0.5
   done
 
-  die_with_log "failed to decode HTTP-FLV playback for ${stream}" "${log_file}"
+  logs=("${log_file}")
+  while IFS= read -r file; do
+    logs+=("${file}")
+  done < <(stream_logs "${stream}")
+  die_with_log "failed to decode HTTP-FLV playback for ${stream}" "${logs[@]}"
 }
 
 capture_and_decode_ts_playback() {

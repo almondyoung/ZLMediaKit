@@ -23,6 +23,9 @@
 
 namespace mediakit {
 
+class HttpChunkedSplitter;
+class HttpPublisherBase;
+
 class HttpSession: public toolkit::Session,
                    public FlvMuxer,
                    public HttpRequestSplitter,
@@ -32,6 +35,7 @@ public:
     using KeyValue = StrCaseMap;
     using HttpResponseInvoker = HttpResponseInvokerImp ;
     friend class AsyncSender;
+    friend class HttpPublisherBase;
     /**
      * @param errMsg 如果为空，则代表鉴权通过，否则为错误提示
      * @param accessPath 运行或禁止访问的根目录
@@ -64,14 +68,14 @@ protected:
 
     /**
      * 重载之用于处理不定长度的content
-     * 这个函数可用于处理大文件上传、http-flv推流
+     * 这个函数可用于处理大文件上传、http推流
      * @param header http请求头
      * @param data content分片数据
      * @param len content分片数据大小
      * @param totalSize content总大小,如果为0则是不限长度content
      * @param recvedSize 已收数据大小
      * Overload for handling indefinite length content
-     * This function can be used to handle large file uploads, http-flv streaming
+     * This function can be used to handle large file uploads, http streaming
      * @param header http request header
      * @param data content fragment data
      * @param len content fragment data size
@@ -80,13 +84,11 @@ protected:
      
      * [AUTO-TRANSLATED:ee75080d]
      */
-    virtual void onRecvUnlimitedContent(const Parser &header,
-                                        const char *data,
-                                        size_t len,
-                                        size_t totalSize,
-                                        size_t recvedSize){
-        shutdown(toolkit::SockException(toolkit::Err_shutdown,"http post content is too huge,default closed"));
-    }
+    void onRecvUnlimitedContent(const Parser &header,
+                                const char *data,
+                                size_t len,
+                                size_t totalSize,
+                                size_t recvedSize);
 
     /**
      * websocket客户端连接上事件
@@ -135,6 +137,10 @@ private:
     void onHttpRequest_OPTIONS();
 
     bool checkLiveStream(const std::string &schema, const std::string  &url_suffix, const std::function<void(const MediaSource::Ptr &src)> &cb);
+    bool parseHttpPublishInfo(const Parser &parser, MediaInfo &info, std::string &err, std::string &format, MediaOriginType &origin_type);
+    std::shared_ptr<HttpPublisherBase> getHttpPublisher(const Parser &parser, bool &is_push_request);
+    void onRecvUnlimitedContent_l(const Parser &header, const char *data, size_t len, size_t totalSize, size_t recvedSize);
+    void onRecvChunkedContent(const Parser &header, const char *data, size_t len);
 
     bool checkLiveStreamFlv(const std::function<void()> &cb = nullptr);
     bool checkLiveStreamTS(const std::function<void()> &cb = nullptr);
@@ -159,6 +165,7 @@ private:
     bool _is_live_stream = false;
     bool _live_over_websocket = false;
     bool _is_websocket = false;
+    bool _http_publish_error = false;
     // 超时时间  [AUTO-TRANSLATED:f15e2672]
     // Timeout
     size_t _keep_alive_sec = 0;
@@ -175,6 +182,8 @@ private:
     toolkit::Ticker _ticker;
     TSMediaSource::RingType::RingReader::Ptr _ts_reader;
     FMP4MediaSource::RingType::RingReader::Ptr _fmp4_reader;
+    std::shared_ptr<HttpPublisherBase> _http_publisher;
+    std::shared_ptr<HttpChunkedSplitter> _chunked_splitter;
     // 处理content数据的callback  [AUTO-TRANSLATED:38890e8d]
     // Callback to handle content data
     std::function<bool (const char *data,size_t len) > _on_recv_body;

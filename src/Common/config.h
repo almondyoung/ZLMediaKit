@@ -87,8 +87,8 @@ extern const std::string kBroadcastOnRtspAuth;
 // If err is empty, it means authentication is successful.
 using PublishAuthInvoker = std::function<void(const std::string &err, const ProtocolOption &option)>;
 
-// 收到rtsp/rtmp推流事件广播，通过该事件控制推流鉴权  [AUTO-TRANSLATED:72417373]
-// Broadcast for receiving rtsp/rtmp push stream event. Control push stream authentication through this event.
+// 收到rtsp/rtmp/http-flv/http-ts/http-ps推流事件广播，通过该事件控制推流鉴权  [AUTO-TRANSLATED:72417373]
+// Broadcast for receiving rtsp/rtmp/http-flv/http-ts/http-ps push stream event. Control push stream authentication through this event.
 extern const std::string kBroadcastMediaPublish;
 #define BroadcastMediaPublishArgs const MediaOriginType &type, const MediaInfo &args, const Broadcast::PublishAuthInvoker &invoker, toolkit::SockInfo &sender
 
@@ -98,8 +98,8 @@ extern const std::string kBroadcastMediaPublish;
 // If err is empty, it means authentication is successful.
 using AuthInvoker = std::function<void(const std::string &err)>;
 
-// 播放rtsp/rtmp/http-flv事件广播，通过该事件控制播放鉴权  [AUTO-TRANSLATED:eddd7014]
-// Broadcast for playing rtsp/rtmp/http-flv events. Control playback authentication through this event.
+// 播放rtsp/rtmp/http-flv/http-ts/http-fmp4/hls事件广播，通过该事件控制播放鉴权  [AUTO-TRANSLATED:eddd7014]
+// Broadcast for playing rtsp/rtmp/http-flv/http-ts/http-fmp4/hls events. Control playback authentication through this event.
 extern const std::string kBroadcastMediaPlayed;
 #define BroadcastMediaPlayedArgs const MediaInfo &args, const Broadcast::AuthInvoker &invoker, toolkit::SockInfo &sender
 
@@ -108,8 +108,8 @@ extern const std::string kBroadcastMediaPlayed;
 extern const std::string kBroadcastShellLogin;
 #define BroadcastShellLoginArgs const std::string &user_name, const std::string &passwd, const Broadcast::AuthInvoker &invoker, toolkit::SockInfo &sender
 
-// 停止rtsp/rtmp/http-flv会话后流量汇报事件广播  [AUTO-TRANSLATED:69df61d8]
-// Broadcast for traffic reporting event after stopping rtsp/rtmp/http-flv session
+// 停止rtsp/rtmp/http-flv/http-ts/http-ps会话后流量汇报事件广播  [AUTO-TRANSLATED:69df61d8]
+// Broadcast for traffic reporting event after stopping rtsp/rtmp/http-flv/http-ts/http-ps session
 extern const std::string kBroadcastFlowReport;
 #define BroadcastFlowReportArgs const MediaInfo &args, const uint64_t &totalBytes, const uint64_t &totalDuration, const bool &isPlayer, toolkit::SockInfo &sender
 

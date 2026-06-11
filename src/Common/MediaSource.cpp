@@ -48,6 +48,9 @@ string getOriginTypeString(MediaOriginType type){
         SWITCH_CASE(device_chn);
         SWITCH_CASE(rtc_push);
         SWITCH_CASE(srt_push);
+        SWITCH_CASE(http_flv_push);
+        SWITCH_CASE(http_ts_push);
+        SWITCH_CASE(http_ps_push);
         default : return "unknown";
     }
 }

@@ -1,0 +1,130 @@
+name: HTTP Publish Smoke
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 19 * * *"
+  push:
+    paths:
+      - ".github/workflows/http_publish_smoke.yml"
+      - "CMakeLists.txt"
+      - "api/include/mk_events.h"
+      - "cmake/**"
+      - "server/**"
+      - "src/Common/**"
+      - "src/Extension/**"
+      - "src/Http/**"
+      - "src/Rtmp/**"
+      - "src/Rtsp/**"
+      - "tests/http_publish_smoke.sh"
+  pull_request:
+    paths:
+      - ".github/workflows/http_publish_smoke.yml"
+      - "CMakeLists.txt"
+      - "api/include/mk_events.h"
+      - "cmake/**"
+      - "server/**"
+      - "src/Common/**"
+      - "src/Extension/**"
+      - "src/Http/**"
+      - "src/Rtmp/**"
+      - "src/Rtsp/**"
+      - "tests/http_publish_smoke.sh"
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: ${{ matrix.variant }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: default
+            build-dir: build-http-publish-smoke
+            cmake-extra-args: ""
+            expect-ts-disabled: "0"
+            expect-ps-disabled: "0"
+          - variant: no-hls
+            build-dir: build-http-publish-smoke-nohls
+            cmake-extra-args: "-DENABLE_HLS=OFF"
+            expect-ts-disabled: "1"
+            expect-ps-disabled: "0"
+          - variant: no-rtpproxy
+            build-dir: build-http-publish-smoke-nortpproxy
+            cmake-extra-args: "-DENABLE_RTPPROXY=OFF"
+            expect-ts-disabled: "0"
+            expect-ps-disabled: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download submodules
+        run: |
+          mv -f .gitmodules_github .gitmodules
+          git submodule sync
+          git submodule update --init 3rdpart/ZLToolKit 3rdpart/media-server 3rdpart/jsoncpp 3rdpart/pybind11
+
+      - name: Install smoke dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl ffmpeg
+
+      - name: Check smoke script syntax
+        run: bash -n tests/http_publish_smoke.sh
+
+      - name: Configure MediaServer
+        run: |
+          cmake -S . -B "${{ matrix.build-dir }}" \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DENABLE_OPENSSL=OFF \
+            -DENABLE_WEBRTC=OFF \
+            -DENABLE_SRT=OFF \
+            -DENABLE_SCTP=OFF \
+            -DENABLE_FFMPEG=OFF \
+            -DENABLE_PLAYER=OFF \
+            -DENABLE_API=OFF \
+            -DENABLE_TESTS=OFF \
+            -DENABLE_OBJCOPY=OFF \
+            -DDISABLE_REPORT=ON \
+            ${{ matrix.cmake-extra-args }}
+
+      - name: Build MediaServer
+        run: cmake --build "${{ matrix.build-dir }}" --target MediaServer --parallel 2
+
+      - name: Run HTTP publish smoke
+        env:
+          EXPECT_TS_DISABLED: ${{ matrix.expect-ts-disabled }}
+          EXPECT_PS_DISABLED: ${{ matrix.expect-ps-disabled }}
+          KEEP_TMP: "1"
+          TMPDIR: ${{ runner.temp }}/http-publish-smoke-${{ matrix.variant }}
+        run: |
+          mkdir -p "$TMPDIR"
+          tests/http_publish_smoke.sh "$GITHUB_WORKSPACE/release/linux/Debug/MediaServer"
+
+      - name: Show smoke diagnostics
+        if: failure()
+        run: |
+          smoke_root="${{ runner.temp }}/http-publish-smoke-${{ matrix.variant }}"
+          if [ -d "$smoke_root" ]; then
+            find "$smoke_root" -maxdepth 3 -type f -print
+            find "$smoke_root" -maxdepth 2 -type f \( -name '*.log' -o -name '*.ini' \) -print | while read -r file; do
+              echo "::group::$file"
+              tail -n 200 "$file" || true
+              echo "::endgroup::"
+            done
+          fi
+
+      - name: Upload smoke logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: http-publish-smoke-${{ matrix.variant }}-logs
+          path: ${{ runner.temp }}/http-publish-smoke-${{ matrix.variant }}/**
+          if-no-files-found: ignore
+          retention-days: 14

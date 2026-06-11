@@ -46,6 +46,21 @@ die() {
   exit 1
 }
 
+die_with_log() {
+  local message="$1"
+  shift
+  local detail=""
+
+  for file in "$@"; do
+    [[ -f "${file}" ]] || continue
+    echo "---- ${file} ----" >&2
+    tail -n 80 "${file}" >&2 || true
+    detail="${detail}"$'\n'"---- ${file} ----"$'\n'"$(tail -n 40 "${file}" 2>/dev/null || true)"
+  done
+
+  die "${message}${detail}"
+}
+
 log() {
   printf '[http-publish-smoke] %s\n' "$*"
 }
@@ -377,10 +392,12 @@ decode_flv_playback() {
   local stream="$1"
   local log_file="${TMP_DIR}/${stream}.pull.flv.log"
 
-  ffmpeg -hide_banner -loglevel warning \
+  if ! ffmpeg -hide_banner -loglevel warning \
     -rw_timeout 5000000 \
     -t 3 -i "${BASE_URL}/live/${stream}.live.flv" \
-    -f null - >"${log_file}" 2>&1
+    -f null - >"${log_file}" 2>&1; then
+    die_with_log "failed to decode HTTP-FLV playback for ${stream}" "${log_file}"
+  fi
 }
 
 capture_and_decode_ts_playback() {
@@ -389,26 +406,32 @@ capture_and_decode_ts_playback() {
   local capture_log="${TMP_DIR}/${stream}.pull.ts.log"
   local decode_log="${TMP_DIR}/${stream}.decode.ts.log"
 
-  ffmpeg -hide_banner -loglevel warning -y \
+  if ! ffmpeg -hide_banner -loglevel warning -y \
     -rw_timeout 5000000 \
     -t 4 -i "${BASE_URL}/live/${stream}.live.ts" \
-    -c copy -f mpegts "${capture_file}" >"${capture_log}" 2>&1
+    -c copy -f mpegts "${capture_file}" >"${capture_log}" 2>&1; then
+    die_with_log "failed to capture HTTP-TS playback for ${stream}" "${capture_log}"
+  fi
 
   [[ -s "${capture_file}" ]] || die "captured empty HTTP-TS playback for ${stream}"
 
-  ffmpeg -hide_banner -loglevel warning \
-    -i "${capture_file}" -t 2 -f null - >"${decode_log}" 2>&1
+  if ! ffmpeg -hide_banner -loglevel warning \
+    -i "${capture_file}" -t 2 -f null - >"${decode_log}" 2>&1; then
+    die_with_log "failed to decode captured HTTP-TS playback for ${stream}" "${decode_log}"
+  fi
 }
 
 generate_ts_seed() {
   local output_file="$1"
 
-  ffmpeg -hide_banner -loglevel warning -y \
+  if ! ffmpeg -hide_banner -loglevel warning -y \
     -f lavfi -i "testsrc2=size=320x240:rate=25" \
     -t 1 \
     -an \
     -c:v libx264 -preset ultrafast -tune zerolatency -g 25 -pix_fmt yuv420p \
-    -f mpegts "${output_file}" >"${TMP_DIR}/stream-replace-seed.log" 2>&1
+    -f mpegts "${output_file}" >"${TMP_DIR}/stream-replace-seed.log" 2>&1; then
+    die_with_log "failed to generate stream_replace TS seed" "${TMP_DIR}/stream-replace-seed.log"
+  fi
 
   [[ -s "${output_file}" ]] || die "failed to generate stream_replace TS seed"
 }

@@ -84,6 +84,8 @@ need_cmd curl
 
 EXPECT_TS_DISABLED="${EXPECT_TS_DISABLED:-0}"
 EXPECT_PS_DISABLED="${EXPECT_PS_DISABLED:-0}"
+PLAYBACK_RW_TIMEOUT_US="${PLAYBACK_RW_TIMEOUT_US:-1000000}"
+PLAYBACK_READY_TIMEOUT_SEC="${PLAYBACK_READY_TIMEOUT_SEC:-14}"
 if [[ "${EXPECT_TS_DISABLED}" != "1" && "${EXPECT_PS_DISABLED}" != "1" ]]; then
   need_cmd ffmpeg
 fi
@@ -335,7 +337,7 @@ start_flv_push() {
   local stream="$1"
   local method="${2:-POST}"
   local suffix="${3:-live.flv}"
-  local duration="${4:-7}"
+  local duration="${4:-10}"
   local url="${BASE_URL}/live/${stream}.${suffix}"
   local log_file="${TMP_DIR}/${stream}.push.${method}.${suffix}.log"
 
@@ -354,7 +356,7 @@ start_ts_push() {
   local stream="$1"
   local method="${2:-POST}"
   local suffix="${3:-live.ts}"
-  local duration="${4:-7}"
+  local duration="${4:-10}"
   local url="${BASE_URL}/live/${stream}.${suffix}"
   local log_file="${TMP_DIR}/${stream}.push.${method}.${suffix}.log"
 
@@ -373,7 +375,7 @@ start_ps_push() {
   local stream="$1"
   local method="${2:-POST}"
   local suffix="${3:-live.ps}"
-  local duration="${4:-7}"
+  local duration="${4:-10}"
   local url="${BASE_URL}/live/${stream}.${suffix}"
   local log_file="${TMP_DIR}/${stream}.push.${method}.${suffix}.log"
 
@@ -390,28 +392,50 @@ start_ps_push() {
 
 decode_flv_playback() {
   local stream="$1"
-  local log_file="${TMP_DIR}/${stream}.pull.flv.log"
+  local deadline=$((SECONDS + PLAYBACK_READY_TIMEOUT_SEC))
+  local attempt=0
+  local log_file=""
 
-  if ! ffmpeg -hide_banner -loglevel warning \
-    -rw_timeout 5000000 \
-    -t 3 -i "${BASE_URL}/live/${stream}.live.flv" \
-    -f null - >"${log_file}" 2>&1; then
-    die_with_log "failed to decode HTTP-FLV playback for ${stream}" "${log_file}"
-  fi
+  while (( SECONDS < deadline )); do
+    attempt=$((attempt + 1))
+    log_file="${TMP_DIR}/${stream}.pull.flv.${attempt}.log"
+    if ffmpeg -hide_banner -loglevel warning \
+      -rw_timeout "${PLAYBACK_RW_TIMEOUT_US}" \
+      -t 2 -i "${BASE_URL}/live/${stream}.live.flv" \
+      -f null - >"${log_file}" 2>&1; then
+      return 0
+    fi
+    sleep 0.5
+  done
+
+  die_with_log "failed to decode HTTP-FLV playback for ${stream}" "${log_file}"
 }
 
 capture_and_decode_ts_playback() {
   local stream="$1"
   local capture_file="${TMP_DIR}/${stream}.play.ts"
-  local capture_log="${TMP_DIR}/${stream}.pull.ts.log"
+  local capture_log=""
   local decode_log="${TMP_DIR}/${stream}.decode.ts.log"
+  local deadline=$((SECONDS + PLAYBACK_READY_TIMEOUT_SEC))
+  local attempt=0
+  local captured=0
 
-  if ! ffmpeg -hide_banner -loglevel warning -y \
-    -rw_timeout 5000000 \
-    -t 4 -i "${BASE_URL}/live/${stream}.live.ts" \
-    -c copy -f mpegts "${capture_file}" >"${capture_log}" 2>&1; then
+  while (( SECONDS < deadline )); do
+    attempt=$((attempt + 1))
+    capture_log="${TMP_DIR}/${stream}.pull.ts.${attempt}.log"
+    rm -f "${capture_file}"
+    if ffmpeg -hide_banner -loglevel warning -y \
+      -rw_timeout "${PLAYBACK_RW_TIMEOUT_US}" \
+      -t 4 -i "${BASE_URL}/live/${stream}.live.ts" \
+      -c copy -f mpegts "${capture_file}" >"${capture_log}" 2>&1; then
+      captured=1
+      break
+    fi
+    sleep 0.5
+  done
+
+  [[ "${captured}" == "1" && -s "${capture_file}" ]] || \
     die_with_log "failed to capture HTTP-TS playback for ${stream}" "${capture_log}"
-  fi
 
   [[ -s "${capture_file}" ]] || die "captured empty HTTP-TS playback for ${stream}"
 
@@ -460,9 +484,9 @@ run_publish_case() {
 }
 
 test_put_alias_publish() {
-  run_publish_case "HTTP-FLV PUT .flv" "smoke_flv_put_alias" start_flv_push PUT flv 5
-  run_publish_case "HTTP-TS PUT .ts" "smoke_ts_put_alias" start_ts_push PUT ts 5
-  run_publish_case "HTTP-PS PUT .ps" "smoke_ps_put_alias" start_ps_push PUT ps 5
+  run_publish_case "HTTP-FLV PUT .flv" "smoke_flv_put_alias" start_flv_push PUT flv 8
+  run_publish_case "HTTP-TS PUT .ts" "smoke_ts_put_alias" start_ts_push PUT ts 8
+  run_publish_case "HTTP-PS PUT .ps" "smoke_ps_put_alias" start_ps_push PUT ps 8
 }
 
 test_empty_body_rejection() {

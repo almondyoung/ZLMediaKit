@@ -82,6 +82,14 @@ stream_logs() {
   done
 }
 
+server_logs() {
+  local file
+  [[ -f "${SERVER_STDOUT}" ]] && printf '%s\n' "${SERVER_STDOUT}"
+  for file in "${LOG_DIR}"/*.log; do
+    [[ -f "${file}" ]] && printf '%s\n' "${file}"
+  done
+}
+
 alloc_port() {
   python3 - <<'PY'
 import socket
@@ -145,7 +153,7 @@ cleanup() {
 
   if [[ "${status}" -ne 0 ]]; then
     gha_error "HTTP publish smoke failed with exit status ${status}; see smoke diagnostics below"
-    for file in "${SERVER_STDOUT}" "${HOOK_STDOUT}" "${TMP_DIR}"/*.log; do
+    for file in "${SERVER_STDOUT}" "${HOOK_STDOUT}" "${TMP_DIR}"/*.log "${LOG_DIR}"/*.log; do
       [[ -f "${file}" ]] || continue
       echo "---- ${file} ----" >&2
       tail -n 120 "${file}" >&2 || true
@@ -429,6 +437,9 @@ decode_flv_playback() {
   while IFS= read -r file; do
     logs+=("${file}")
   done < <(stream_logs "${stream}")
+  while IFS= read -r file; do
+    logs+=("${file}")
+  done < <(server_logs)
   die_with_log "failed to decode HTTP-FLV playback for ${stream}" "${logs[@]}"
 }
 

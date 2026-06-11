@@ -137,6 +137,7 @@ void HttpRequestSplitter::input(const char *data,size_t len) {
     // _content_len < 0;数据按照不固定长度content处理  [AUTO-TRANSLATED:68d6a4d0]
     // _content_len < 0; Data is processed according to variable length content
     onRecvContent(ptr,_remain_data_size);//消费掉所有剩余数据
+    _remain_data_size = 0;
     _remain_data.clear();
 }
 
@@ -178,4 +179,3 @@ HttpRequestSplitter::HttpRequestSplitter() {
 }
 
 } /* namespace mediakit */
-

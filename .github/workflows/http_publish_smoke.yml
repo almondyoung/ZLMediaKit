@@ -107,11 +107,24 @@ jobs:
           mkdir -p "$TMPDIR"
           tests/http_publish_smoke.sh "$GITHUB_WORKSPACE/release/linux/Debug/MediaServer"
 
+      - name: Show smoke diagnostics
+        if: failure()
+        run: |
+          smoke_root="${{ runner.temp }}/http-publish-smoke-${{ matrix.variant }}"
+          if [ -d "$smoke_root" ]; then
+            find "$smoke_root" -maxdepth 3 -type f -print
+            find "$smoke_root" -maxdepth 2 -type f \( -name '*.log' -o -name '*.ini' \) -print | while read -r file; do
+              echo "::group::$file"
+              tail -n 200 "$file" || true
+              echo "::endgroup::"
+            done
+          fi
+
       - name: Upload smoke logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: http-publish-smoke-${{ matrix.variant }}-logs
-          path: ${{ runner.temp }}/http-publish-smoke-${{ matrix.variant }}/zlm-http-publish.*
+          path: ${{ runner.temp }}/http-publish-smoke-${{ matrix.variant }}/**
           if-no-files-found: ignore
           retention-days: 14

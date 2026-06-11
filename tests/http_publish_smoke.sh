@@ -26,8 +26,23 @@ esac
 DEFAULT_MEDIA_SERVER_BIN="${ROOT_DIR}/release/${OS_DIR}/Debug/MediaServer"
 MEDIA_SERVER_BIN="${MEDIA_SERVER_BIN:-${1:-${DEFAULT_MEDIA_SERVER_BIN}}}"
 
+gha_escape() {
+  local msg="$*"
+  msg="${msg//'%'/'%25'}"
+  msg="${msg//$'\r'/'%0D'}"
+  msg="${msg//$'\n'/'%0A'}"
+  printf '%s' "${msg}"
+}
+
+gha_error() {
+  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    printf '::error::%s\n' "$(gha_escape "$*")" >&2
+  fi
+}
+
 die() {
   echo "ERROR: $*" >&2
+  gha_error "$*"
   exit 1
 }
 
@@ -93,6 +108,15 @@ cleanup() {
   if [[ -n "${HOOK_PID}" ]] && kill -0 "${HOOK_PID}" >/dev/null 2>&1; then
     kill "${HOOK_PID}" >/dev/null 2>&1 || true
     wait "${HOOK_PID}" >/dev/null 2>&1 || true
+  fi
+
+  if [[ "${status}" -ne 0 ]]; then
+    gha_error "HTTP publish smoke failed with exit status ${status}; see smoke diagnostics below"
+    for file in "${SERVER_STDOUT}" "${HOOK_STDOUT}" "${TMP_DIR}"/*.log; do
+      [[ -f "${file}" ]] || continue
+      echo "---- ${file} ----" >&2
+      tail -n 120 "${file}" >&2 || true
+    done
   fi
 
   if [[ "${status}" -eq 0 && "${KEEP_TMP:-0}" != "1" ]]; then
